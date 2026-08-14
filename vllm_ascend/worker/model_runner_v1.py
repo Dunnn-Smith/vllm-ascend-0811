@@ -153,6 +153,7 @@ from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
+from vllm_ascend.spec_decode.adaptive_verification import StepTimingCollector
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
@@ -450,6 +451,16 @@ class NPUModelRunner(GPUModelRunner):
         self.enable_enpu = _enpu is not None and _enpu.lower() == "true"
 
         self._set_up_drafter()
+        adaptive_verification = getattr(
+            self.drafter, "adaptive_verification", None
+        )
+        # The collector is dormant outside startup profiling, so the normal
+        # dummy/execute paths only pay a cheap None/boolean check.
+        self.adaptive_verification_timing = (
+            StepTimingCollector()
+            if adaptive_verification is not None
+            else None
+        )
 
         # Backends that consume CPU seq_lens (AscendAttentionBackend,
         # AscendMLABackend, and DSV4 compressed attention metadata) need
@@ -1754,19 +1765,26 @@ class NPUModelRunner(GPUModelRunner):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         out = super().take_draft_token_ids()
         per_req_k = getattr(self.drafter, "_dspark_num_verify_tokens", None)
-        if per_req_k is None:
+        if out is None or per_req_k is None:
             return out
+        # One batched D2H transfer is substantially cheaper than calling
+        # int(NPU_scalar) once per request. The scheduler then receives the
+        # exact prefix lengths and builds the next target batch normally.
+        per_req_k = per_req_k[: len(out.req_ids)].to(device="cpu", non_blocking=False)
         per_req_k = [
             max(0, min(int(k), self.num_spec_tokens))
-            for k in per_req_k
+            for k in per_req_k.tolist()
         ]
         cut_tokens = DraftTokenIds(
             req_ids=out.req_ids,
             draft_token_ids=[
                 tokens[:k]
-                for tokens, k in zip(out.draft_token_ids, per_req_k)
+                for tokens, k in zip(out.draft_token_ids, per_req_k, strict=True)
             ],
         )
+        # Do not reuse a stale length vector if a later step produces no DSpark
+        # proposal (for example, during a mixed prefill transition).
+        self.drafter._dspark_num_verify_tokens = None
         return cut_tokens
 
     @torch.inference_mode()
@@ -3183,6 +3201,7 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        adaptive_profile_curve: str = "both"
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3424,6 +3443,16 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            timing = self.adaptive_verification_timing
+            if timing is not None:
+                timing.record_batch(
+                    num_target_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    full_graph=cudagraph_runtime_mode == CUDAGraphMode.FULL,
+                    profile_curve=adaptive_profile_curve,
+                )
+                timing.forward_start()
+
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3440,6 +3469,8 @@ class NPUModelRunner(GPUModelRunner):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
+            if timing is not None:
+                timing.forward_end()
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -3447,6 +3478,8 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter and not profile_cpp:
+                if timing is not None:
+                    timing.drafter_start()
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -3458,6 +3491,8 @@ class NPUModelRunner(GPUModelRunner):
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
                 )
+                if timing is not None:
+                    timing.drafter_end()
             if is_profile and self.dynamic_eplb:
                 self.eplb_updator.adaptor.clear_all_moe_loads()
             if not is_profile and self.dynamic_eplb:
@@ -4884,6 +4919,32 @@ class NPUModelRunner(GPUModelRunner):
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             cuda_graph_size = GPUModelRunner.capture_model(self)
+
+        adaptive_verification = getattr(self.drafter, "adaptive_verification", None)
+        timing = self.adaptive_verification_timing
+        if (
+            adaptive_verification is not None
+            and timing is not None
+            and not adaptive_verification.is_profiled
+        ):
+            # Price the exact target graph grid after capture. Eager-only
+            # deployments pass an empty grid and the manager builds a bounded
+            # geometric profile instead.
+            capture_descs = self.cudagraph_dispatcher.get_capture_descs()
+            capture_sizes = sorted({desc.num_tokens for _, descs in capture_descs for desc in descs})
+            max_context_len = max(1, self.model_config.max_model_len - self.uniform_decode_query_len,)
+            profile_context_len = min(
+                adaptive_verification.profile_context_len,
+                max_context_len,
+            )
+            with timing.collect() as samples:
+                for kwargs in adaptive_verification.batches_to_profile(
+                    capture_sizes,
+                    self.uniform_decode_query_len,
+                    profile_context_len,
+                ):
+                    self._dummy_run(**kwargs)
+            adaptive_verification.set_initial_cost_curves(samples)
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and hasattr(self, "update_stream"):
