@@ -1156,10 +1156,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_token_ids = logits.argmax(dim=-1)
         else:
             if self.method == "dspark":
-                # Dspark speculation requires autoregressive applications of MarkovHead and ConfidenceHead.
-                # The MarkovHead performs bias correction on logits.
-                # The ConfidenceHead predicts the expected acceptance length of tokens(Not yet achieved).
-
+                # DSpark applies MarkovHead autoregressively to correct each
+                # position's logits. ConfidenceHead then predicts conditional
+                # acceptance probabilities for the cost-aware verify policy.
+ 
                 # `sample_hidden_states` has been all-gathered to full.
                 # `markov_emb` should also be full to match it.
                 # We changed `flash_comm_v1_enabled` to avoid `markov_emb` from being split.
