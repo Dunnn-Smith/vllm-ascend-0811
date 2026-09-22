@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
+import copy
 import math
 from collections import defaultdict
 from dataclasses import replace
@@ -23,7 +24,10 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
-from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.core.kv_cache_interface import (
+    AscendDSAReplicatedSlidingWindowMLASpec,
+    is_prefix_cacheable,
+)
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     get_glm5_next_kv_cache_config,
@@ -40,6 +44,7 @@ _orig_get_kv_cache_groups_uniform_page_size = vllm.v1.core.kv_cache_utils._get_k
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
 _orig_get_packed_kv_cache_groups = vllm.v1.core.kv_cache_utils._get_packed_kv_cache_groups
 _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+_orig_get_kv_cache_configs = vllm.v1.core.kv_cache_utils.get_kv_cache_configs
 _orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
 
@@ -306,20 +311,21 @@ def _get_kv_cache_groups_uniform_groups(
 
     # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
     # Possibly padding layer tuples for this.
-    # Additionally, we also pad KV blocks in each SWA layer, to align the page size
-    # with the corresponding layer in the full-MLA group.
+    # Legacy SWA/state groups reuse the full-MLA page-size buckets. Globally
+    # replicated DCP groups retain the page sizes declared by their caches:
+    # their block counts do not shrink with the sharded C4 history.
     all_page_sizes = _page_sizes(full_mla_spec)
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         sm_page_sizes = _page_sizes(sm_spec)
-        layers_per_size: dict[int, list[str]] = defaultdict(list)
-        assert max(sm_page_sizes) <= max(all_page_sizes)
-
-        # Unify page size by padding layers' page_size to the nearest larger page_size.
-        # Compute candidate (nearest larger page_size) for each unique page size.
-        size_to_candidate: dict[int, int] = {}
-        for ps in sm_page_sizes:
-            size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
+        preserve_page_sizes = all(
+            isinstance(spec, AscendDSAReplicatedSlidingWindowMLASpec) for spec in sm_spec.kv_cache_specs.values()
+        )
+        if preserve_page_sizes:
+            size_to_candidate = {ps: ps for ps in sm_page_sizes}
+        else:
+            assert max(sm_page_sizes) <= max(all_page_sizes)
+            size_to_candidate = {ps: min(x for x in all_page_sizes if x >= ps) for ps in sm_page_sizes}
         # Pad and collect layer names per page size.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes
@@ -388,17 +394,16 @@ def _get_deepseek_v4_cache_layout(
 ) -> tuple[list[int], list[dict[int, list[str]]], list[str], int, int]:
     """Return the geometry shared by DSV4 planning and rank normalization.
 
-    Precondition: kv_cache_groups[0] is the full-MLA group; its page sizes
-    define the canonical bucket set. Non-full-MLA groups must have been
-    page_size-padded upstream (see _get_kv_cache_groups_uniform_groups) so
-    every layer's page_size matches one of the full-MLA bucket sizes.
+    Include page-size buckets from every group. Globally replicated DCP
+    SWA/state groups can retain smaller pages than the full-MLA group, so
+    those pages need their own region in the same shared backing allocation.
 
     For each group, bucket its layers by page_size_bytes and place each layer
     at tuple_idx = position-within-bucket.
     """
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
-    page_sizes = sorted(_page_sizes(full_mla_spec))
+    page_sizes = _page_sizes(full_mla_spec)
 
     # Pre-bucket each group's layers by page_size (registration order within
     # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
@@ -410,6 +415,7 @@ def _get_deepseek_v4_cache_layout(
         specs = group.kv_cache_spec.kv_cache_specs
         b: dict[int, list[str]] = defaultdict(list)
         for name in group.layer_names:
+            page_sizes.add(specs[name].page_size_bytes)
             if "mtp" not in name:
                 b[specs[name].page_size_bytes].append(name)
             else:
@@ -423,7 +429,8 @@ def _get_deepseek_v4_cache_layout(
     # this equals the sub-group size (each has a single page_size).
     num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values()) + len(mtp_layer_names)
 
-    return page_sizes, bucketed, mtp_layer_names, mtp_page_size, num_layer_tuples
+    return sorted(page_sizes), bucketed, mtp_layer_names, mtp_page_size, num_layer_tuples
+ 
 
 
 def _get_kv_cache_config_deepseek_v4_main(
@@ -534,16 +541,11 @@ def _ascend_max_memory_usage_bytes_from_groups(
         return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
     assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
-    full_mla_spec = kv_cache_groups[0].kv_cache_spec
-    assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
-    layer_tuple_bytes = sum(_page_sizes(full_mla_spec))
-    num_layer_tuples = max(
-        _get_max_layers_per_page_size(group.kv_cache_spec)
-        for group in kv_cache_groups
-        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-    )
-    return sum(
-        num_layer_tuples * group.kv_cache_spec.max_memory_usage_pages(vllm_config) * layer_tuple_bytes
+    # Use the planner's actual shared-tuple stride, including any MTP slots.
+    # A second, independently computed stride can admit more block IDs than
+    # the backing allocation provides.
+    return _ascend_pool_bytes_per_block(kv_cache_groups) * sum(
+        group.kv_cache_spec.max_memory_usage_pages(vllm_config)
         for group in kv_cache_groups
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
     )
@@ -582,6 +584,109 @@ def _ascend_get_kv_cache_config_from_groups(
     )
 
 
+def _ascend_get_kv_cache_configs(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """Fit DSV4 DCP's in-flight prefill budget to the real shared pool.
+
+    Tiny compressor-state pages use the same BlockPool as C4 and its global
+    Indexer. During a large prefill the state group can hold an entire batch
+    of blocks at once, each consuming a full shared tuple. Find the largest
+    batch that fits; changing the admission formula alone would admit more
+    blocks than the physical pool can hold.
+    """
+    parallel = vllm_config.parallel_config
+    cache_config = vllm_config.cache_config
+    if (
+        parallel.decode_context_parallel_size > 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.pipeline_parallel_size == 1
+        and cache_config.num_gpu_blocks_override is None
+        and kv_cache_specs
+        and any(
+            getattr(spec, "model_version", None) == "deepseek_v4"
+            for spec in kv_cache_specs[0].values()
+        )
+    ):
+        # DeepSeek-V4 grouping pads some SlidingWindowMLASpec pages in-place.
+        # This preflight runs before upstream validates that the per-worker
+        # KVCacheSpecs are identical, so grouping the live worker-0 objects
+        # would make worker 0 differ from the remaining TP/DCP workers.
+        probe_specs = copy.deepcopy(kv_cache_specs[0])
+        groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups(
+            vllm_config, probe_specs
+        )
+        # Match upstream get_kv_cache_configs(): BlockPool permanently reserves
+        # one null block, so admission checks plan against usable memory rather
+        # than the full profiled KV-cache memory. Without this subtraction the
+        # preflight can fit exactly one shared-pool block more than the real
+        # capacity check and still fail immediately afterwards.
+        budget = min(available_memory) - _ascend_pool_bytes_per_block(groups)
+        if _ascend_max_memory_usage_bytes_from_groups(vllm_config, groups) > budget:
+            scheduler = vllm_config.scheduler_config
+            requested_tokens = scheduler.max_num_batched_tokens
+            low, high = 1, requested_tokens
+            fitted_tokens = 0
+            while low <= high:
+                mid = (low + high) // 2
+                scheduler.max_num_batched_tokens = mid
+                if _ascend_max_memory_usage_bytes_from_groups(vllm_config, groups) <= budget:
+                    fitted_tokens = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            scheduler.max_num_batched_tokens = fitted_tokens or requested_tokens
+            if fitted_tokens:
+                logger.warning(
+                    "DeepSeek-V4 DCP KV pool fits at most %d batched tokens "
+                    "(requested %d); reducing the prefill batch to preserve "
+                    "max_model_len=%d.",
+                    fitted_tokens,
+                    requested_tokens,
+                    vllm_config.model_config.max_model_len,
+                )
+
+    configs = _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory)
+    if (
+        parallel.decode_context_parallel_size > 1
+        and configs
+        and _is_deepseek_v4_groups(configs[0].kv_cache_groups)
+    ):
+        groups = configs[0].kv_cache_groups
+        full_history_blocks = 0
+        recycled_peak_blocks = 0
+        group_peaks = []
+        for group in groups:
+            group_spec = group.kv_cache_spec
+            assert isinstance(group_spec, UniformTypeKVCacheSpecs)
+            blocks = group_spec.max_memory_usage_pages(vllm_config)
+            first_spec = next(iter(group_spec.kv_cache_specs.values()))
+            group_peaks.append((group.layer_names[0], first_spec.block_size, blocks, sorted(_page_sizes(group_spec))))
+            if isinstance(first_spec, AscendDSAReplicatedSlidingWindowMLASpec):
+                recycled_peak_blocks += blocks
+            else:
+                full_history_blocks += blocks
+        logger.info(
+            "DeepSeek-V4 DCP KV admission: pool_blocks=%d, "
+            "bytes_per_pool_block=%d, full_history_blocks_at_max_len=%d, "
+            "recycled_peak_blocks_at_inflight_budget=%d, "
+            "max_num_batched_tokens=%d, max_in_flight_tokens=%d, "
+            "group_peaks=(first_layer, tokens_per_block, peak_blocks, page_sizes) %s. "
+            "The full-sequence admission gate and startup sizing both "
+            "include recycled state; each scheduled chunk checks actual blocks.",
+            configs[0].num_blocks,
+            _ascend_pool_bytes_per_block(groups),
+            full_history_blocks,
+            recycled_peak_blocks,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.max_in_flight_tokens,
+            group_peaks,
+        )
+    return configs
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 assert _orig_get_packed_kv_cache_groups is not None
 vllm.v1.core.kv_cache_utils._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
@@ -591,6 +696,7 @@ KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
     _kv_cache_config_has_mamba_layers
 )
 vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_configs = _ascend_get_kv_cache_configs
 vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
 vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
 
@@ -598,3 +704,4 @@ vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.engine.core.get_kv_cache_configs = _ascend_get_kv_cache_configs
