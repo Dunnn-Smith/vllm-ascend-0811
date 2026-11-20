@@ -2415,7 +2415,20 @@ ge::graphStatus SparseFlashMlaTiling::DoOpTiling(SMLATilingInfo *tilingInfo)
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(tilingInfo->platformInfo);
     uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
     uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
-    uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(aivNum, aicNum, aivNum);
+    constexpr uint32_t DECODE_KV_SPLIT_COUNT = 2U;
+    constexpr uint32_t DECODE_HEAD_COUNT = 8U;
+    const bool splitKvDecode =
+        ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910B &&
+        tilingInfo->perfMode == SMLATemplateMode::CSA_TEMPLATE_MODE &&
+        tilingInfo->qLayout == SMLALayout::TND && tilingInfo->kvLayout == SMLALayout::PA_BBND &&
+        tilingInfo->gSize == DECODE_HEAD_COUNT && tilingInfo->s1Size != 0U &&
+        tilingInfo->s1Size <= aicNum / DECODE_KV_SPLIT_COUNT &&
+        tilingInfo->sparseBlockCount == sInnerSize_ && (tilingInfo->cmpRatio == 1 || tilingInfo->cmpRatio == 2) &&
+        tilingInfo->oriMaskMode == SMLA_ORI_MASK_MODE_BAND &&
+        !IsNonEmptyOptionalTensor(tilingInfo->opParamInfo.seqUsedQ.tensor) &&
+        !tilingInfo->returnSoftmaxLse && !tilingInfo->batchConsistency;
+    const uint32_t slices = splitKvDecode ? tilingInfo->s1Size * DECODE_KV_SPLIT_COUNT : aivNum;
+    uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(slices, aicNum, aivNum);
     context_->SetBlockDim(blockDim);
     OP_LOGI(tilingInfo->opName, "SMLA block dim: %u aiv Num: %u aic Num: %u.", blockDim, aivNum, aicNum);
 
@@ -2448,14 +2461,15 @@ ge::graphStatus SparseFlashMlaTiling::DoOpTiling(SMLATilingInfo *tilingInfo)
             workspaceSize += TRIPLE_BUFFER_NUM * S2_REAL_BUF_LEN * sizeof(int32_t) * aivNum;
         }
     } else {
-        workspaceSize += PRELOAD_NUM * mmResUbSize_ * MM1_RES_ELEM_SIZE * aicNum;
-        workspaceSize += PRELOAD_NUM * mmResUbSize_ * VEC1_RES_ELEM_SIZE * aicNum;
-        workspaceSize += PRELOAD_NUM * bmm2ResUbSize_ * MM2_RES_ELEM_SIZE * aicNum;
-        workspaceSize += PRELOAD_NUM * bmm2ResUbSize_ * VEC2_RES_ELEM_SIZE * aicNum;
+        const uint32_t workspaceCoreNum = splitKvDecode ? blockDim : aicNum;
+        workspaceSize += PRELOAD_NUM * mmResUbSize_ * MM1_RES_ELEM_SIZE * workspaceCoreNum;
+        workspaceSize += PRELOAD_NUM * mmResUbSize_ * VEC1_RES_ELEM_SIZE * workspaceCoreNum;
+        workspaceSize += PRELOAD_NUM * bmm2ResUbSize_ * MM2_RES_ELEM_SIZE * workspaceCoreNum;
+        workspaceSize += PRELOAD_NUM * bmm2ResUbSize_ * VEC2_RES_ELEM_SIZE * workspaceCoreNum;
         if (tilingInfo->perfMode == SMLATemplateMode::CSA_TEMPLATE_MODE ||
             (tilingInfo->perfMode == SMLATemplateMode::SWA_TEMPLATE_MODE && tilingInfo->hasOriSparseIndices)) {
-            constexpr uint32_t MERGE_CACHE_GM_BUF_NUM = 3;                    // 3：缓存缓冲区数量
-            workspaceSize += MERGE_CACHE_GM_BUF_NUM * 512 * 512 * 2 * aicNum; // 缓冲区的尺寸为512x512字节，2表示双缓冲
+            constexpr uint32_t MERGE_CACHE_GM_BUF_NUM = 3;
+            workspaceSize += MERGE_CACHE_GM_BUF_NUM * 512 * 512 * sizeof(uint16_t) * workspaceCoreNum;
         }
     }
 
@@ -2524,7 +2538,8 @@ ge::graphStatus SparseFlashMlaTiling::DoOpTiling(SMLATilingInfo *tilingInfo)
     if (tilingInfo->npuArch == NpuArch::DAV_3510) {
         splitG = static_cast<uint32_t>(tilingInfo->gSize > 64); // 64：分组拆分阈值
     }
-    tilingKey = GET_TPL_TILING_KEY(0U, qLayout, inputKvLayout, static_cast<uint32_t>(tilingInfo->perfMode), splitG,
+    tilingKey = GET_TPL_TILING_KEY(static_cast<uint32_t>(splitKvDecode), qLayout, inputKvLayout,
+                                   static_cast<uint32_t>(tilingInfo->perfMode), splitG,
                                    headRatioOne, static_cast<uint32_t>(tilingInfo->batchConsistency), vectorizeFlag);
     context_->SetScheduleMode(1);
     context_->SetTilingKey(tilingKey);

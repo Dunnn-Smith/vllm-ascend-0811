@@ -81,11 +81,11 @@ CSA 多核调度、G=1/128、非均匀 batch、aclgraph、极端空范围还应�
 
 | 构建目标 | 裁剪前 key 数 | 当前 key 数 | 保留的硬件特化 |
 | --- | --- | --- | --- |
-| A2/A3 | 320 | 6 | CSA 的 `HEAD_RATIO_ONE=0/1`，`SPLIT_G=IS_VEC_S2PHYADDR=0` |
+| A2/A3 | 320 | 7 | CSA 的 `HEAD_RATIO_ONE=0/1`，`SPLIT_G=IS_VEC_S2PHYADDR=0`，另编译 A2 CSA 的双组 KV 分片模板 |
 | A5 | 320 | 12 | `HEAD_RATIO_ONE=0`，保留 split-G 和 CSA 物理地址向量化 |
-| Host | 320 | 14 | 两个设备集合的并集，仅用于 key 编码及校验 |
+| Host | 320 | 15 | 两个设备集合的并集，仅用于 key 编码及校验 |
 
-两个设备集合共有 4 个 key，共用部分分别编译。A2/A3 不编译 A5 专用标志组合；A5 不编译 A2/A3 的单头专用模板。确定性级别仍进入 host key，因此两边都保留 `BATCH_CONSISTENCY=0/1`。`FLASH_DECODE` 固定为 0，decode 调度由 metadata 驱动。模板声明的参数顺序、位宽和取值不变，保留的 key 编码不变。
+两个设备集合共有 4 个 key，共用部分分别编译。A2/A3 不编译 A5 专用标志组合；A5 不编译 A2/A3 的单头专用模板。确定性级别仍进入 host key，因此两边都保留 `BATCH_CONSISTENCY=0/1`。`FLASH_DECODE=1` 仅由 A2 的 CSA 双组分片路径选择，并在主算子内按 TND query 行分配核组。其余路径沿用 metadata 调度。模板声明的参数顺序、位宽和取值不变，保留的 key 编码不变。
 
 `DeepseekV41EagerAttentionImpl._native_attention` 的 C0 走 SWA，C1/C2 走 CSA；cache spec 固定 BF16，query 与 KV 需要同 dtype。压缩比例、TopK 和请求长度都是运行时参数。编译保留全部本地 head 数边界，包括 TP 后只剩一个 query head 的 CSA。
 

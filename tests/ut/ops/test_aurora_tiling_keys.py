@@ -234,10 +234,12 @@ class AuroraTilingKeysTest(unittest.TestCase):
                 vectorize_flags = (0, 1) if arch == 310 and mode == 2 else (0,)
                 for vectorize in vectorize_flags:
                     expected.add((0, 1, 2, mode, split_g, head_ratio_one, batch_consistency, vectorize))
+            if arch == 220:
+                expected.add((1, 1, 2, 2, 0, 0, 0, 0))
             with self.subTest(arch=arch):
                 selected = self.matrices["sparse_flash_mla", arch]
                 self.assertEqual(set(selected), expected)
-                self.assertEqual(len(selected), 6 if arch == 220 else 12)
+                self.assertEqual(len(selected), 7 if arch == 220 else 12)
                 self.assertEqual(len(selected), len(set(selected)))
 
     def test_sparse_mla_architectures_exclude_each_others_specializations(self):
@@ -248,7 +250,7 @@ class AuroraTilingKeysTest(unittest.TestCase):
         self.assertEqual(len(a2a3 & a5), 4)
         host = self.matrices["sparse_flash_mla", None]
         self.assertEqual(set(host), a2a3 | a5)
-        self.assertEqual(len(host), 14)
+        self.assertEqual(len(host), 15)
 
     def test_sparse_mla_scope_and_a2a3_qli_quantization(self):
         for arch in (None, 220, 310):

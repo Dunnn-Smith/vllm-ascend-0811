@@ -46,16 +46,12 @@ struct TempLoopInfo {
 
     bool curActSeqLenIsZero = false;
 
-    uint32_t tndCoreStartKVSplitPos = 0;
     bool tndIsS2SplitCore = false;
     uint32_t gS1Idx = 0U;
     uint32_t s1StartIdx = 0;
     uint32_t s1EndIdx = 0;
     uint64_t mBasicSizeTail = 0U; // gS1方向循环的尾基本块大小
-    uint32_t cmpLoopTimes = 0;
     uint32_t oriLoopTimes = 0;
-    uint32_t v0OriSize = 0;
-    uint32_t v0CmpSize = 0;
 
     // sparsemode = 4
     int32_t oriMaskRight = 0;
@@ -164,11 +160,11 @@ private:
 
     GlobalTensor<UPDATE_T> vec2ResGm;
 
-    GlobalTensor<T> accumOutGm;
-
     // ================================Init functions==================================
     __aicore__ inline void InitTilingData();
     __aicore__ inline void InitCalcParamsEach();
+    __aicore__ inline bool InitSplitDecodeRange(uint32_t queryRow);
+    __aicore__ inline bool IsSecondKvShard() const { return (aiCoreIdx & 1U) != 0U; }
     __aicore__ inline void InitBuffers();
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsKV);
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsKV,
@@ -282,7 +278,8 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::InitActualSeqLen(__gm__ uint8_t
         actualSeqLengthsCmpKVGm.SetGlobalBuffer((__gm__ int32_t *)actualSeqLengthsCmpKV, constInfo.actualLenDimsCmpKV);
     }
     if (constInfo.actualLenDimsQ != 0) {
-        actualSeqLengthsQGm.SetGlobalBuffer((__gm__ int32_t *)actualSeqLengthsQ, constInfo.actualLenDimsQ);
+        const uint32_t qLengthCount = constInfo.actualLenDimsQ + (LAYOUT_T == SMLA_LAYOUT::TND ? 1U : 0U);
+        actualSeqLengthsQGm.SetGlobalBuffer((__gm__ int32_t *)actualSeqLengthsQ, qLengthCount);
     }
 }
 
@@ -507,7 +504,9 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::Init(
     }
 
     metadataGm.SetGlobalBuffer((__gm__ uint32_t *)metadata);
-    InitCalcParamsEach();
+    if constexpr (!FLASH_DECODE) {
+        InitCalcParamsEach();
+    }
 
     pipe = tPipe;
     // init global buffer
@@ -569,14 +568,13 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::Init(
 
     kvMergeGm_.SetGlobalBuffer(
         (__gm__ KV_T *)(workspace + offset + aiCoreIdx * 512 * 512 * MERGE_CACHE_GM_BUF_NUM * sizeof(KV_T)));
-    offset += GetBlockNum() * 512 * 512 * 4 * sizeof(KV_T);
 
     if ASCEND_IS_AIV {
         vectorBlock.InitParams(constInfo, tilingData);
         vectorBlock.InitVec0GlobalTensor(kvMergeGm_, oriKvGm, cmpKvGm, oriBlockTableGm, cmpBlockTableGm);
         vectorBlock.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm, actualSeqLengthsKVGm, topKGm,
                                          sinksGm, softmaxLseGm);
-        vectorBlock.InitVec2GlobalTensor(accumOutGm, vec2ResGm, mm2ResGm, attentionOutGm);
+        vectorBlock.InitVec2GlobalTensor(vec2ResGm, mm2ResGm, attentionOutGm);
     }
 
     if ASCEND_IS_AIC {
@@ -605,6 +603,30 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::InitCalcParamsEach()
 }
 
 template <typename SMLAT>
+__aicore__ inline bool SparseFlashMlaCsa<SMLAT>::InitSplitDecodeRange(uint32_t queryRow)
+{
+    // Find the first request end greater than the packed query row.
+    uint32_t begin = 0;
+    uint32_t end = constInfo.batchSize;
+    while (begin < end) {
+        uint32_t middle = (begin + end) / 2U;
+        if (queryRow < static_cast<uint32_t>(actualSeqLengthsQGm.GetValue(middle + 1U))) {
+            end = middle;
+        } else {
+            begin = middle + 1U;
+        }
+    }
+    if (begin == constInfo.batchSize) {
+        return false; // The tensor may include graph padding beyond the last request.
+    }
+    constInfo.bN2Start = begin;
+    constInfo.bN2End = begin;
+    constInfo.gS1Start = queryRow - actualSeqLengthsQGm.GetValue(begin);
+    constInfo.gS1End = constInfo.gS1Start + 1U;
+    return true;
+}
+
+template <typename SMLAT>
 __aicore__ inline void SparseFlashMlaCsa<SMLAT>::CalcParams(uint32_t loop, uint32_t cmpLoop, uint64_t s2Start,
                                                             uint32_t s2LoopIdx, RunInfo &info)
 {
@@ -618,8 +640,9 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::CalcParams(uint32_t loop, uint3
     info.s1Idx = tempLoopInfo.gS1Idx / constInfo.gSize;
     info.s2Idx = s2LoopIdx;
     info.curSInnerLoopTimes = tempLoopInfo.s2LoopTimes;
-    info.tndIsS2SplitCore = tempLoopInfo.tndIsS2SplitCore;
-    info.tndCoreStartKVSplitPos = tempLoopInfo.tndCoreStartKVSplitPos;
+    if constexpr (FLASH_DECODE) {
+        info.tndIsS2SplitCore = tempLoopInfo.tndIsS2SplitCore;
+    }
     info.isBmm2Output = false;
     info.actS1Size = tempLoopInfo.actS1Size;
 
@@ -701,6 +724,12 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::CalcParams(uint32_t loop, uint3
                 info.v0S2Start = 512;
             }
             info.v0S2DealSize = 512;
+            if constexpr (FLASH_DECODE) {
+                if (info.tndIsS2SplitCore) {
+                    info.v0S2Start = IsSecondKvShard() ? constInfo.s2BaseSize / 2U : 0U;
+                    info.v0S2DealSize = info.actualSingleProcessSInnerSize;
+                }
+            }
         }
     }
 
@@ -758,21 +787,42 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::ComputeMm2(const RunInfo &info)
 template <typename SMLAT>
 __aicore__ inline void SparseFlashMlaCsa<SMLAT>::Process()
 {
-    uint32_t hasLoad = metadataGm.GetValue(GetAttrAbsIndex(aiCoreIdx, FA_CORE_ENABLE_INDEX, false));
-    if (hasLoad == 0) {
+    const uint32_t scheduleCore = FLASH_DECODE ? 0U : aiCoreIdx;
+    if (metadataGm.GetValue(GetAttrAbsIndex(scheduleCore, FA_CORE_ENABLE_INDEX, false)) == 0U) {
         return;
     }
-    if ASCEND_IS_AIV {
-        vectorBlock.AllocEventID();
-        vectorBlock.InitSoftmaxDefaultBuffer();
-    } else {
-        cubeBlock.AllocEventID();
+
+    bool hasLoad = true;
+    if constexpr (FLASH_DECODE) {
+        const uint32_t queryRow = aiCoreIdx / 2U;
+        hasLoad = queryRow < constInfo.qSeqSize && InitSplitDecodeRange(queryRow);
     }
-    ProcessBalance();
-    if ASCEND_IS_AIV {
-        vectorBlock.FreeEventID();
-    } else {
-        cubeBlock.FreeEventID();
+    if (hasLoad) {
+        if ASCEND_IS_AIV {
+            vectorBlock.AllocEventID();
+            vectorBlock.InitSoftmaxDefaultBuffer(!IsSecondKvShard());
+        } else {
+            cubeBlock.AllocEventID();
+        }
+        ProcessBalance();
+    }
+
+    if constexpr (FLASH_DECODE) {
+        // Every launched Cube and Vector joins, including padding and short-KV shards.
+        SyncAll<false>();
+        if ASCEND_IS_AIV {
+            if (tempLoopInfo.tndIsS2SplitCore && !IsSecondKvShard() && GetSubBlockIdx() == 0) {
+                vectorBlock.CombineSplitKv(tensorACoreOffset, tempLoopInfo.s2LoopTimes - 1U);
+            }
+        }
+    }
+
+    if (hasLoad) {
+        if ASCEND_IS_AIV {
+            vectorBlock.FreeEventID();
+        } else {
+            cubeBlock.FreeEventID();
+        }
     }
 }
 
@@ -790,7 +840,6 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::ProcessBalance()
     uint32_t gloop = 0;
     uint32_t cmpLoop = 0;
     uint32_t gS1LoopEnd = 0;
-    bool globalLoopStart = true;
 
     if ASCEND_IS_AIC {
         CrossCoreSetFlag<ConstInfo::SMLA_SYNC_MODE2, PIPE_MTE2>(3);
@@ -858,10 +907,19 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::ProcessBalance()
             uint32_t oriSplitNum = 0;
             uint32_t cmpSplitNum = 0;
             uint32_t cmpS2Size = 0;
+            if constexpr (FLASH_DECODE) {
+                tempLoopInfo.tndIsS2SplitCore =
+                    !tempLoopInfo.curActSeqLenIsZero && tempLoopInfo.actCmpS2Size == constInfo.s2BaseSize;
+                if (IsSecondKvShard() && !tempLoopInfo.tndIsS2SplitCore) {
+                    continue;
+                }
+            }
             bool isEnd = (bN2LoopIdx + 1 == constInfo.bN2End) && (gS1LoopIdx + 1 == gS1LoopEnd);
             if (tempLoopInfo.curActSeqLenIsZero) {
                 if ASCEND_IS_AIV {
-                    InitAllZeroOutput(tempLoopInfo.bIdx, tempLoopInfo.s1StartIdx, tempLoopInfo.n2Idx);
+                    if (!FLASH_DECODE || GetSubBlockIdx() == 0) {
+                        InitAllZeroOutput(tempLoopInfo.bIdx, tempLoopInfo.s1StartIdx, tempLoopInfo.n2Idx);
+                    }
                 }
                 if (!isEnd) {
                     continue;
@@ -869,29 +927,25 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::ProcessBalance()
             } else {
                 oriSplitNum = CeilDiv(oriS2Size, constInfo.s2BaseSize);
                 cmpS2Size = tempLoopInfo.actCmpS2Size;
+                if constexpr (FLASH_DECODE) {
+                    if (tempLoopInfo.tndIsS2SplitCore) {
+                        // Keep the whole SWA window with the first half of long KV.
+                        cmpS2Size /= 2U;
+                        tempLoopInfo.actCmpS2Size = cmpS2Size;
+                        if (IsSecondKvShard()) {
+                            oriSplitNum = 0;
+                        }
+                    }
+                }
                 cmpSplitNum = CeilDiv(cmpS2Size, constInfo.s2BaseSize);
             }
 
             uint32_t s2SplitNum = oriSplitNum + cmpSplitNum;
-            constexpr uint32_t V0_SPLIT = 32; // align to 32
-            uint32_t v0OriSize = CeilDiv(oriS2Size * cmpS2Size, oriS2Size + cmpS2Size);
-            if (cmpS2Size > V0_SPLIT * oriSplitNum) {
-                v0OriSize = SMLAAlign(v0OriSize, V0_SPLIT * oriSplitNum);
-            }
-            uint32_t v0CmpSize = cmpS2Size - v0OriSize;
-
             tempLoopInfo.oriLoopTimes = oriSplitNum;
-            tempLoopInfo.cmpLoopTimes = cmpSplitNum;
             tempLoopInfo.s2LoopTimes = s2SplitNum;
-            tempLoopInfo.v0OriSize = v0OriSize;
-            tempLoopInfo.v0CmpSize = v0CmpSize;
 
             uint32_t s2LoopEnd = (isEnd && constInfo.s2End != 0) ? constInfo.s2End : tempLoopInfo.s2LoopTimes;
             tempLoopInfo.s2LoopTimes = s2LoopEnd;
-            // 分核修改后需要打开
-            // 当前s2是否被切，决定了输出是否要写到attenOut上
-            tempLoopInfo.tndIsS2SplitCore = ((constInfo.s2Start == 0) && (s2LoopEnd == s2SplitNum)) ? false : true;
-            tempLoopInfo.tndCoreStartKVSplitPos = globalLoopStart ? constInfo.coreStartKVSplitPos : 0;
             uint32_t extraLoop = isEnd ? 2 : 0;
             uint32_t curTopKIdx = 0;
             for (uint32_t s2LoopIdx = constInfo.s2Start; s2LoopIdx < (s2LoopEnd + extraLoop); s2LoopIdx++) {
@@ -901,7 +955,6 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::ProcessBalance()
                     ++cmpLoop;
                 }
             }
-            globalLoopStart = false;
             constInfo.s2Start = 0;
         }
         constInfo.gS1Start = 0;

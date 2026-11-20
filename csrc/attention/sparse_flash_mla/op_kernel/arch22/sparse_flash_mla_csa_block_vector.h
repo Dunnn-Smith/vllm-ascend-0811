@@ -54,13 +54,15 @@ public:
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm,
                                                 GlobalTensor<int32_t> topKGm, GlobalTensor<T> sinksGm,
                                                 GlobalTensor<T> softmaxLseGm);
-    __aicore__ inline void InitVec2GlobalTensor(GlobalTensor<T> accumOutGm, GlobalTensor<UPDATE_T> vec2ResGm,
+    __aicore__ inline void InitVec2GlobalTensor(GlobalTensor<UPDATE_T> vec2ResGm,
                                                 GlobalTensor<MM2_OUT_T> mm2ResGm, GlobalTensor<OUT_T> attentionOutGm);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
+    __aicore__ inline void LoadSinks(LocalTensor<SINKS_T> dst);
     __aicore__ inline void CopySinksIn();
     __aicore__ inline void SliceAndContactSinksValue(uint32_t nIdx, uint32_t dealRowCount);
-    __aicore__ inline void InitSoftmaxDefaultBuffer();
+    __aicore__ inline void InitSoftmaxDefaultBuffer(bool includeSink);
+    __aicore__ inline void CombineSplitKv(uint64_t outputOffset, uint32_t lastLoop);
     // ================================Base Vector==========================================
     __aicore__ inline void RowDivs(LocalTensor<float> dstUb, LocalTensor<float> src0Ub, LocalTensor<float> src1Ub,
                                    uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
@@ -95,16 +97,12 @@ public:
                                                 uint32_t actualColumnCount);
     __aicore__ inline void ProcessVec2Inner(const RunInfo &info, const MSplitInfo &mSplitInfo, uint32_t mStartRow,
                                             uint32_t mDealSize);
-    __aicore__ inline void Bmm2DataCopyOutTrans(const RunInfo &info, LocalTensor<OUT_T> &attenOutUb, uint32_t wsMStart,
-                                                uint32_t dealRowCount, uint32_t columnCount,
-                                                uint32_t actualColumnCount);
-    __aicore__ inline void Bmm2ResCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb, uint32_t wsMStart,
-                                          uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
-    __aicore__ inline void Bmm2CastAndCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb, uint32_t wsMStart,
+    __aicore__ inline void Bmm2CastAndCopyOut(uint64_t outputOffset, LocalTensor<T> &bmm2ResUb,
                                               uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
-    __aicore__ inline void Bmm2FDDataCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb, uint32_t wsMStart,
-                                             uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
-    __aicore__ inline uint64_t CalcAccumOffset(uint32_t bN2Idx, uint32_t gS1Idx);
+    __aicore__ inline void FinalizeVec2(const RunInfo &info, LocalTensor<T> &bmm2ResUb, uint32_t mStart,
+                                        uint32_t baseOffset, uint32_t dealRowCount, uint32_t columnCount,
+                                        uint32_t actualColumnCount);
+    __aicore__ inline void StageSplitKv(uint32_t softmaxOffset);
 
     // BLOCK和REPEAT的字节数
     static constexpr uint64_t BYTE_BLOCK = 32UL;
@@ -156,7 +154,6 @@ private:
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
     GlobalTensor<UPDATE_T> vec2ResGm;
     GlobalTensor<MM2_OUT_T> mm2ResGm;
-    GlobalTensor<T> accumOutGm;
     GlobalTensor<OUT_T> attentionOutGm;
     GlobalTensor<T> softmaxLseGm;
 
@@ -223,9 +220,13 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(softmaxMaxDefaultBuff, ConstInfo::BUFFER_SIZE_BYTE_1K);
     pipe->InitBuffer(softmaxSumDefaultBuff, ConstInfo::BUFFER_SIZE_BYTE_1K);
 
-    pipe->InitBuffer(sinksBuff, MAX_N1_SIZE * sizeof(SINKS_T));
-    // 分配256+N1大小内存，其中256是m轴VEC最大切块
-    pipe->InitBuffer(sinksBrcbBuff, MAX_N1_SIZE * sizeof(SINKS_T) * BLOCK_ELEMENT_NUM * 3U);
+    if constexpr (!FLASH_DECODE) {
+        pipe->InitBuffer(sinksBuff, MAX_N1_SIZE * sizeof(SINKS_T));
+        // 分配256+N1大小内存，其中256是m轴VEC最大切块
+        pipe->InitBuffer(sinksBrcbBuff, MAX_N1_SIZE * sizeof(SINKS_T) * BLOCK_ELEMENT_NUM * 3U);
+        sinksUb = sinksBuff.Get<SINKS_T>();
+        sinksBrcbUb = sinksBrcbBuff.Get<SINKS_T>();
+    }
 
     softmaxMaxUb = softmaxMaxBuff.Get<T>();
     softmaxSumUb = softmaxSumBuff.Get<T>();
@@ -237,9 +238,6 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::InitBuffers(TPipe *pipe)
     kvMergUb_ = inputBuff2.Get<KV_T>();
 
     v0ValidSizeUb_ = v0ValidSizeBuff.Get<int32_t>();
-
-    sinksUb = sinksBuff.Get<SINKS_T>();
-    sinksBrcbUb = sinksBrcbBuff.Get<SINKS_T>();
 }
 
 template <typename SMLAT>
@@ -280,12 +278,10 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::InitVec1GlobalTensor(
 }
 
 template <typename SMLAT>
-__aicore__ inline void SMLAVectorBlock<SMLAT>::InitVec2GlobalTensor(GlobalTensor<T> accumOutGm,
-                                                                    GlobalTensor<UPDATE_T> vec2ResGm,
+__aicore__ inline void SMLAVectorBlock<SMLAT>::InitVec2GlobalTensor(GlobalTensor<UPDATE_T> vec2ResGm,
                                                                     GlobalTensor<MM2_OUT_T> mm2ResGm,
                                                                     GlobalTensor<OUT_T> attentionOutGm)
 {
-    this->accumOutGm = accumOutGm;
     this->vec2ResGm = vec2ResGm;
     this->mm2ResGm = mm2ResGm;
     this->attentionOutGm = attentionOutGm;
@@ -314,17 +310,23 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::FreeEventID()
 }
 
 template <typename SMLAT>
-__aicore__ inline void SMLAVectorBlock<SMLAT>::CopySinksIn()
+__aicore__ inline void SMLAVectorBlock<SMLAT>::LoadSinks(LocalTensor<SINKS_T> dst)
 {
     DataCopyExtParams dataCopyParams;
     dataCopyParams.blockCount = 1U;
     dataCopyParams.blockLen = constInfo.qHeadNum * sizeof(T);
     dataCopyParams.srcStride = 0U;
     dataCopyParams.dstStride = 0U;
-    DataCopyPadExtParams<T> padParams;
-    DataCopyPad(sinksUb, sinksGm, dataCopyParams, padParams);
+    const DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+    DataCopyPad(dst, sinksGm, dataCopyParams, padParams);
     SetFlag<AscendC::HardEvent::MTE2_V>(SYNC_SINKS_BUF_FLAG);
     WaitFlag<AscendC::HardEvent::MTE2_V>(SYNC_SINKS_BUF_FLAG);
+}
+
+template <typename SMLAT>
+__aicore__ inline void SMLAVectorBlock<SMLAT>::CopySinksIn()
+{
+    LoadSinks(sinksUb);
     uint32_t repeatTimes = (constInfo.qHeadNum + BLOCK_ELEMENT_NUM - 1U) / BLOCK_ELEMENT_NUM; // 每次处理 8 datablocks
     Brcb(sinksBrcbUb, sinksUb, repeatTimes, {1, BLOCK_ELEMENT_NUM});
     PipeBarrier<PIPE_V>();
@@ -360,11 +362,23 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::SliceAndContactSinksValue(uint32_
 }
 
 template <typename SMLAT>
-__aicore__ inline void SMLAVectorBlock<SMLAT>::InitSoftmaxDefaultBuffer()
+__aicore__ inline void SMLAVectorBlock<SMLAT>::InitSoftmaxDefaultBuffer(bool includeSink)
 {
-    CopySinksIn();
-    Duplicate(softmaxMaxDefaultUb, SOFTMAX_MIN_NUM, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
-    Duplicate(softmaxSumDefaultUb, R0, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
+    if constexpr (FLASH_DECODE) {
+        // In this template only Vector 0 processes the eight query heads.
+        if (GetSubBlockIdx() == 0) {
+            Duplicate(softmaxSumDefaultUb, includeSink ? R0 : 0.0f, constInfo.gSize);
+            if (includeSink) {
+                LoadSinks(softmaxMaxDefaultUb);
+            } else {
+                Duplicate(softmaxMaxDefaultUb, SOFTMAX_MIN_NUM, constInfo.gSize);
+            }
+        }
+    } else {
+        CopySinksIn();
+        Duplicate(softmaxMaxDefaultUb, SOFTMAX_MIN_NUM, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
+        Duplicate(softmaxSumDefaultUb, R0, SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T));
+    }
 }
 
 template <typename SMLAT>
@@ -508,9 +522,11 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::ProcessVec1SingleBuf(const RunInf
     uint32_t loopCount = (mSplitInfo.vecDealM + mSplitSize - 1) / mSplitSize;
     uint32_t tailSplitSize = mSplitInfo.vecDealM - (loopCount - 1) * mSplitSize;
 
-    uint32_t sinkHeadIdx =
-        (info.n2IdxReal * constInfo.gSize + mSplitInfo.nBufferStartM + mSplitInfo.vecStartM) % constInfo.qHeadNum;
-    SliceAndContactSinksValue(sinkHeadIdx, mSplitInfo.vecDealM);
+    if constexpr (!FLASH_DECODE) {
+        uint32_t sinkHeadIdx =
+            (info.n2IdxReal * constInfo.gSize + mSplitInfo.nBufferStartM + mSplitInfo.vecStartM) % constInfo.qHeadNum;
+        SliceAndContactSinksValue(sinkHeadIdx, mSplitInfo.vecDealM);
+    }
 
     for (uint32_t i = 0, dealSize = mSplitSize; i < loopCount; i++) {
         if (i == (loopCount - 1)) {
@@ -735,12 +751,6 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::ProcessVec1L(const RunInfo &info)
 }
 
 template <typename SMLAT>
-__aicore__ inline uint64_t SMLAVectorBlock<SMLAT>::CalcAccumOffset(uint32_t bN2Idx, uint32_t gS1Idx)
-{
-    return 0;
-}
-
-template <typename SMLAT>
 __aicore__ inline void SMLAVectorBlock<SMLAT>::ProcessVec2SingleBuf(const RunInfo &info, const MSplitInfo &mSplitInfo)
 {
     if (mSplitInfo.vecDealM == 0) {
@@ -798,52 +808,79 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::ProcessVec2Inner(const RunInfo &i
 }
 
 template <typename SMLAT>
-__aicore__ inline void SMLAVectorBlock<SMLAT>::Bmm2FDDataCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb,
-                                                                 uint32_t wsMStart, uint32_t dealRowCount,
-                                                                 uint32_t columnCount, uint32_t actualColumnCount)
+__aicore__ inline void SMLAVectorBlock<SMLAT>::StageSplitKv(uint32_t softmaxOffset)
 {
-    LocalTensor<T> tmp = outputBuff1.Get<T>();
-    WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
-    DataCopy(tmp, bmm2ResUb, columnCount * dealRowCount);
-    SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-    WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-    uint64_t accumTmpOutNum = CalcAccumOffset(info.bIdx, info.gS1Idx);
-    uint64_t offset =
-        accumTmpOutNum * constInfo.kvHeadNum * constInfo.mBaseSize * constInfo.headDim +              // taskoffset
-        info.tndCoreStartKVSplitPos * constInfo.kvHeadNum * constInfo.mBaseSize * constInfo.headDim + // 份数offset
-        wsMStart * actualColumnCount;                                                                 // m轴offset
-    GlobalTensor<T> dst = accumOutGm[offset];
-    if (info.actualSingleProcessSInnerSize == 0) {
-        DataCopyExtParams dataCopyParams;
-        dataCopyParams.blockCount = dealRowCount;
-        dataCopyParams.blockLen = actualColumnCount * sizeof(T);
-        dataCopyParams.srcStride = (columnCount - actualColumnCount) / (BYTE_BLOCK / sizeof(T));
-        dataCopyParams.dstStride = 0;
-        DataCopyPad(dst, tmp, dataCopyParams);
-    } else {
-        matmul::InitOutput<T>(dst, dealRowCount * actualColumnCount, ConstInfo::FLOAT_ZERO);
-    }
-    SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
+    const uint32_t heads = constInfo.gSize;
+    const uint32_t numeratorSize = heads * constInfo.headDim;
+    // Reuse the second Vec2 workspace tile. This shard has only one S2 tile.
+    auto stage = tmpBuff1.Get<T>();
+    DataCopy(stage[numeratorSize], softmaxMaxUb[softmaxOffset], heads);
+    DataCopy(stage[numeratorSize + heads], softmaxSumUb[softmaxOffset], heads);
+    SetFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
+    WaitFlag<HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
+    DataCopy(vec2ResGm[constInfo.bmm2ResUbSize], stage, numeratorSize + 2U * heads);
 }
 
 template <typename SMLAT>
-__aicore__ inline void SMLAVectorBlock<SMLAT>::Bmm2DataCopyOutTrans(const RunInfo &info, LocalTensor<OUT_T> &attenOutUb,
-                                                                    uint32_t wsMStart, uint32_t dealRowCount,
-                                                                    uint32_t columnCount, uint32_t actualColumnCount)
+__aicore__ inline void SMLAVectorBlock<SMLAT>::CombineSplitKv(uint64_t outputOffset, uint32_t lastLoop)
 {
-    DataCopyExtParams dataCopyParams;
-    dataCopyParams.blockCount = dealRowCount;
-    dataCopyParams.blockLen = actualColumnCount * sizeof(OUT_T);
-    dataCopyParams.srcStride = (columnCount - actualColumnCount) / (BYTE_BLOCK / sizeof(OUT_T));
-    dataCopyParams.dstStride = 0;
-    DataCopyPad(attentionOutGm[info.attenOutOffset + wsMStart * actualColumnCount], attenOutUb, dataCopyParams);
-    return;
+    const uint32_t heads = constInfo.gSize;
+    const uint32_t headDim = constInfo.headDim;
+    const uint32_t numeratorSize = heads * headDim;
+    const uint32_t softmaxOffset = (lastLoop % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T);
+
+    // The adjacent group wrote its second Vec2 slot. The first numerator is still in UB.
+    auto peer = inputBuff1.Get<T>();
+    WaitFlag<HardEvent::V_MTE2>(SYNC_INPUT_BUF1_FLAG);
+    DataCopy(peer, vec2ResGm[(constInfo.preLoadNum + 1U) * constInfo.bmm2ResUbSize], numeratorSize + 2U * heads);
+    SetFlag<HardEvent::MTE2_V>(SYNC_INPUT_BUF1_FLAG);
+    WaitFlag<HardEvent::MTE2_V>(SYNC_INPUT_BUF1_FLAG);
+
+    auto max0 = softmaxMaxUb[softmaxOffset];
+    auto max1 = peer[numeratorSize];
+    auto sum0 = softmaxSumUb[softmaxOffset];
+    auto sum1 = peer[numeratorSize + heads];
+    auto scratch = v0ValidSizeBuff.Get<T>();
+    auto scale0 = scratch[0];
+    auto scale1 = scratch[heads];
+    auto denom0 = scratch[2U * heads];
+    auto denom1 = scratch[3U * heads];
+    auto rowScale0 = scratch[4U * heads];
+    auto rowScale1 = rowScale0[heads * FP32_BLOCK_ELEMENT_NUM];
+
+    // Rescale both FP32 numerators to a common maximum and normalize once.
+    Max(denom0, max0, max1, heads);
+    PipeBarrier<PIPE_V>();
+    Sub(scale0, max0, denom0, heads);
+    Sub(scale1, max1, denom0, heads);
+    PipeBarrier<PIPE_V>();
+    Exp(scale0, scale0, 2U * heads);
+    PipeBarrier<PIPE_V>();
+    Mul(denom0, scale0, sum0, heads);
+    Mul(denom1, scale1, sum1, heads);
+    PipeBarrier<PIPE_V>();
+    Add(denom0, denom0, denom1, heads);
+    PipeBarrier<PIPE_V>();
+    Div(scale0, scale0, denom0, heads);
+    Div(scale1, scale1, denom0, heads);
+    PipeBarrier<PIPE_V>();
+    Brcb(rowScale0, scale0, 2, {1, FP32_BLOCK_ELEMENT_NUM});
+    PipeBarrier<PIPE_V>();
+
+    auto out = tmpBuff1.Get<T>();
+    RowMuls(out, out, rowScale0, heads, headDim, headDim);
+    RowMuls(peer, peer, rowScale1, heads, headDim, headDim);
+    PipeBarrier<PIPE_V>();
+    Add(out, out, peer, numeratorSize);
+    SetFlag<HardEvent::V_MTE2>(SYNC_INPUT_BUF1_FLAG);
+    PipeBarrier<PIPE_V>();
+    Bmm2CastAndCopyOut(outputOffset, out, heads, headDim, headDim);
 }
 
 template <typename SMLAT>
-__aicore__ inline void SMLAVectorBlock<SMLAT>::Bmm2CastAndCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb,
-                                                                  uint32_t wsMStart, uint32_t dealRowCount,
-                                                                  uint32_t columnCount, uint32_t actualColumnCount)
+__aicore__ inline void SMLAVectorBlock<SMLAT>::Bmm2CastAndCopyOut(uint64_t outputOffset, LocalTensor<T> &bmm2ResUb,
+                                                                  uint32_t dealRowCount, uint32_t columnCount,
+                                                                  uint32_t actualColumnCount)
 {
     LocalTensor<OUT_T> tmpBmm2ResCastTensor = outputBuff1.Get<OUT_T>();
     WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
@@ -855,24 +892,36 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::Bmm2CastAndCopyOut(const RunInfo 
 
     SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
     WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-    Bmm2DataCopyOutTrans(info, tmpBmm2ResCastTensor, wsMStart, dealRowCount, columnCount, actualColumnCount);
+    DataCopyExtParams dataCopyParams;
+    dataCopyParams.blockCount = dealRowCount;
+    dataCopyParams.blockLen = actualColumnCount * sizeof(OUT_T);
+    dataCopyParams.srcStride = (columnCount - actualColumnCount) / (BYTE_BLOCK / sizeof(T));
+    dataCopyParams.dstStride = 0;
+    DataCopyPad(attentionOutGm[outputOffset], tmpBmm2ResCastTensor, dataCopyParams);
     SetFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
 }
 
 template <typename SMLAT>
-__aicore__ inline void SMLAVectorBlock<SMLAT>::Bmm2ResCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb,
-                                                              uint32_t wsMStart, uint32_t dealRowCount,
-                                                              uint32_t columnCount, uint32_t actualColumnCount)
+__aicore__ inline void SMLAVectorBlock<SMLAT>::FinalizeVec2(const RunInfo &info, LocalTensor<T> &bmm2ResUb,
+                                                            uint32_t mStart, uint32_t baseOffset, uint32_t dealRowCount,
+                                                            uint32_t columnCount, uint32_t actualColumnCount)
 {
+    const uint32_t softmaxOffset = (info.loop % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + baseOffset;
     if constexpr (FLASH_DECODE) {
         if (info.tndIsS2SplitCore) {
-            Bmm2FDDataCopyOut(info, bmm2ResUb, wsMStart, dealRowCount, columnCount, actualColumnCount);
-        } else {
-            Bmm2CastAndCopyOut(info, bmm2ResUb, wsMStart, dealRowCount, columnCount, actualColumnCount);
+            if (info.v0S2Start != 0) {
+                StageSplitKv(softmaxOffset);
+            }
+            return;
         }
-    } else {
-        Bmm2CastAndCopyOut(info, bmm2ResUb, wsMStart, dealRowCount, columnCount, actualColumnCount);
     }
+    LocalTensor<T> tmpSumUb = v0ValidSizeBuff.Get<T>()[384];
+    Brcb(tmpSumUb, softmaxSumUb[softmaxOffset], (dealRowCount + 7) / 8, {1, 8});
+    PipeBarrier<PIPE_V>();
+    RowDivs(bmm2ResUb, bmm2ResUb, tmpSumUb, dealRowCount, columnCount, actualColumnCount);
+    PipeBarrier<PIPE_V>();
+    Bmm2CastAndCopyOut(info.attenOutOffset + mStart * actualColumnCount, bmm2ResUb, dealRowCount, columnCount,
+                      actualColumnCount);
 }
 
 template <typename SMLAT>
@@ -933,14 +982,7 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::DealBmm2ResBaseBlock(const RunInf
         }
 
         if (info.isLastS2Loop) {
-            uint32_t idx = info.loop % (constInfo.preLoadNum);
-            LocalTensor<T> tmpSumUb = v0ValidSizeBuff.Get<T>()[384];
-            Brcb(tmpSumUb, softmaxSumUb[idx * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + baseOffset],
-                 (dealRowCount + 7) / 8, {1, 8});
-            PipeBarrier<PIPE_V>();
-            RowDivs(bmm2ResUb, bmm2ResUb, tmpSumUb, dealRowCount, columnCount, actualColumnCount);
-            PipeBarrier<PIPE_V>();
-            Bmm2ResCopyOut(info, bmm2ResUb, mStart, dealRowCount, columnCount, actualColumnCount);
+            FinalizeVec2(info, bmm2ResUb, mStart, baseOffset, dealRowCount, columnCount, actualColumnCount);
         } else {
             LocalTensor<T> outUb = outputBuff1.Get<T>();
             WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
@@ -986,14 +1028,7 @@ __aicore__ inline void SMLAVectorBlock<SMLAT>::DealBmm2ResBaseBlock(const RunInf
 
         // 最后一次输出计算结果，否则将中间结果暂存至workspace
         if (info.isLastS2Loop) {
-            uint32_t idx = info.loop % (constInfo.preLoadNum);
-            LocalTensor<T> tmpSumUb = v0ValidSizeBuff.Get<T>()[384]; // sumUb用临时内存 16 * 32B  = 512B
-            Brcb(tmpSumUb, softmaxSumUb[idx * SOFTMAX_TMP_BUFFER_OFFSET / sizeof(T) + baseOffset],
-                 (dealRowCount + 7) / 8, {1, 8});
-            PipeBarrier<PIPE_V>();
-            RowDivs(bmm2ResUb, bmm2ResUb, tmpSumUb, dealRowCount, columnCount, actualColumnCount);
-            PipeBarrier<PIPE_V>();
-            Bmm2ResCopyOut(info, bmm2ResUb, mStart, dealRowCount, columnCount, actualColumnCount);
+            FinalizeVec2(info, bmm2ResUb, mStart, baseOffset, dealRowCount, columnCount, actualColumnCount);
         } else if (!info.isFirstSInnerLoop) {
             LocalTensor<T> outUb = outputBuff1.Get<T>();
             WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
